@@ -1,0 +1,4 @@
+
+1) A way to show namespaces for userspace programs a la lsof
+
+2) Uid/Gid shift backups
