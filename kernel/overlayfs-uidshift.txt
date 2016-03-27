@@ -1,0 +1,71 @@
+
+Discussion:
+===========
+hmm, not sure i can parse this all but basically i want:
+if an uidshift is applied on a dir
+and that maps 0x20000-0x2ffff to 0-0xffff then this should mean that when the container invokes "chmod 100 /etc/passwd" then what actually hits the disk is 0x20000+100
+and when we stat() /etc/passwd then what is actually on disk is 0x20000+100 but what is passed to the container's processes is 100
+and yes, i only care about privileged container managers setting this all up
+and yes, i don't care how this is implemented, if in the VFS or in overlayfs
+i think the VFS would be cleaner, but I figure would need patching through all file-systems
+
+
+i simply think that system images should always be to the base 0
+and only at execution time be mapped to anything higher
+and at execution time, a new, free range would be picked
+and that range would be used as long as that container thing is around,
+but no longer, and then reused later on, as soon as the container is
+stopped
+i simply believe that allowing shifted uids to ever hit the storage is
+wrong. the storage should only ever store uids/gids to the base 0
+and any mappings should happen at runtime
+
+
+
+
+UID and GID shifts through Overlayfs and VFS
+============================================
+
+
+1) clone(CLONE_NEWUSER|CLONE_NEWNS|CLONE_FS_SHIFT_UIDGID)
+
+   CLONE_FS_SHIFT_UIDGID: mounts that want to shift ther UID and GID
+       - Only a real root user can set this flag.
+       - If this flag is set it will automatically be inherited by
+         children if the parent mount namespace already have it,
+	 otherwise it will always be cleared.
+
+
+   
+   An unprivileged creates a new mount and user namespaces...
+
+   Then he can do whatever he wants to copied mounts into its namespace.
+
+
+2) VFS functions to support UID and GID shifts.
+
+   If called they will check if the current mount namespace has:
+   - CLONE_FS_SHIFT_UIDGID flag set
+   - Is real capable root  (optional)
+
+   If so then perform the shift, otherwise do nothing.
+
+
+3) mount( shift_uids, shift_gids ...)
+
+   Check if shift_uids and shift_gids where set.
+   If so call VFS helpers to do uid and gid shifts.
+
+
+
+
+Notes:
+======
+
+* We need translation on all getattr() functions.
+
+* We need further handling for permissions and security access.
+
+
+
+Testing: move mounts 
