@@ -19,6 +19,8 @@
 #include <limits.h>
 #include <errno.h>
 
+#define CLONE_MNTNS_SHIFT_UIDGID	0x04000000
+
 /* A simple error-handling function: print an error message based
    on the value in 'errno' and terminate the calling process */
 
@@ -50,6 +52,7 @@ usage(char *pname)
     fpe("-M uid_map  Specify UID map for user namespace\n");
     fpe("-G gid_map  Specify GID map for user namespace\n");
     fpe("            If -M or -G is specified, -U is required\n");
+    fpe("-s	     Shift UID and GID according to user namespace\n");
     fpe("-v          Display verbose messages\n");
     fpe("\n");
     fpe("Map strings for -M and -G consist of records of the form:\n");
@@ -149,7 +152,7 @@ main(int argc, char *argv[])
     verbose = 0;
     gid_map = NULL;
     uid_map = NULL;
-    while ((opt = getopt(argc, argv, "+imnpuUM:G:v")) != -1) {
+    while ((opt = getopt(argc, argv, "+simnpuUM:G:v")) != -1) {
         switch (opt) {
         case 'i': flags |= CLONE_NEWIPC;        break;
         case 'm': flags |= CLONE_NEWNS;         break;
@@ -160,6 +163,7 @@ main(int argc, char *argv[])
         case 'M': uid_map = optarg;             break;
         case 'G': gid_map = optarg;             break;
         case 'U': flags |= CLONE_NEWUSER;       break;
+	case 's': flags |= CLONE_MNTNS_SHIFT_UIDGID;	break;
         default:  usage(argv[0]);
         }
     }
