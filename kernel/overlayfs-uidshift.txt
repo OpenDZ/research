@@ -22,6 +22,41 @@ and any mappings should happen at runtime
 
 
 
+Inside the container:
+
+1) 4000-5000 => 0-1000
+
+
+ * Inode in memory:
+
+   uid 4000 => inside the container: 0
+   inode vfs will always map to the container value
+
+   shift uid=4000 is automatic.
+   uid = 0 we make it 4000 => then it will be automatic.
+
+
+ * Inode on disk:
+
+   uid 4000 shift it back to 0 before writing to disk
+
+
+2) 0-1000 => 4000-5000
+
+   uid = 4000 we make it 0 => then it will be automatic
+
+
+ * Inode in memory:
+   uid = 0 we make it 4000 => then it will be automatic.
+
+ * Inode on disk:
+   uid  shift it back to 4000 before writing to disk
+
+
+
+   shift when we read from disk
+   shift when we write to disk again.
+
 
 UID and GID shifts through Overlayfs and VFS
 ============================================
