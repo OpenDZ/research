@@ -40,7 +40,6 @@ static int efd_userns_child;
 static uid_t arg_uid_shift = UID_INVALID;
 static uid_t arg_uid_range = 0x10000U;
 static char *program_name;
-static char *root_dir;
 
 typedef struct base_filesystem {
 	const char *dir;
@@ -49,17 +48,6 @@ typedef struct base_filesystem {
 	const char *exists;
 	bool ignore_failure;
 } base_filesystem;
-
-typedef struct mount_point {
-	const char *what;
-	const char *where;
-	const char *type;
-	const char *options;
-	unsigned long flags;
-	bool out_userns;	/* Before userns */
-	bool in_userns;		/* mount inside userns */
-	bool fatal;
-} mount_point;
 
 static const char root_fs_files[] =
 	"/\0"
@@ -70,66 +58,7 @@ static const char proc_fs_files[] =
 	"/proc/self/cmdline\0"
 	"/proc/1/cmdline\0";
 
-static const base_filesystem fs_table[] = {
-	{ "bin",	0, "usr/bin\0",		NULL },
-	{ "lib",	0, "usr/lib\0",		NULL },
-	{ "root",	0755, NULL,		NULL, true },
-	{ "sbin",	0, "usr/sbin\0",	NULL },
-	{ "usr",	0755, NULL,		NULL },
-	{ "var",	0755, NULL,		NULL },
-	{ "etc",	0755, NULL,		NULL },
-#if defined(__i386__) || defined(__x86_64__)
-	{ "lib64",	0, "usr/lib/x86_64-linux-gnu\0"
-			"usr/lib64\0",		"ld-linux-x86-64.so.2" },
-#endif
-};
-
-static const mount_point mnt_table[] = {
-	{
-		"/proc", "/proc", "proc", NULL,
-		MS_NOSUID|MS_NOEXEC|MS_NODEV, true, true, true,
-	},
-	{
-		"/proc", "/proc", "bind", NULL,
-		MS_BIND, false, true, true,
-	},
-	{
-		"/proc/sys", "/proc/sys", NULL, NULL,
-		MS_BIND, false, true, false,
-	},	/* Bind mount first */
-	{
-		"/proc/sys", "/proc/sys", NULL, NULL,
-		MS_BIND|MS_RDONLY|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_REMOUNT,
-		false, true, false,
-	},	/* Then, make it r/o */
-	{
-		"tmpfs", "/sys", "tmpfs", "mode=755",
-		MS_NOSUID|MS_NOEXEC|MS_NODEV, true, false, false,
-	},
-	{
-		"sysfs", "/sys", "sysfs", NULL,
-		MS_RDONLY|MS_NOSUID|MS_NOEXEC|MS_NODEV, true, false, false,
-	},
-	{
-		"tmpfs", "/dev", "tmpfs", "mode=755",
-		MS_NOSUID|MS_STRICTATIME, true, false, false,
-	},
-	{
-		"tmpfs", "/dev/shm", "tmpfs", "mode=1777",
-		MS_NOSUID|MS_NODEV|MS_STRICTATIME, true, false, false,
-	},
-	{
-		"tmpfs", "/run", "tmpfs", "mode=755",
-		MS_NOSUID|MS_NODEV|MS_STRICTATIME, true, false, false,
-	},
-	{
-		"tmpfs", "/tmp", "tmpfs", "mode=1777",
-		MS_STRICTATIME, true, false, false,
-	},
-};
-
 static const struct option options[] = {
-	{ "dir", required_argument, NULL, 'd'},
 	{ "help", no_argument, NULL, 'h' },
 	{ "users", required_argument, NULL, 'u' },
 };
@@ -138,7 +67,6 @@ static void help(void)
 {
 	printf("%s [OPTIONS...]\n\n"
 	       "-h, --help			Show this help\n"
-	       "-d, --dir=filesystem		root filesystem\n"
 	       "-u, --users[=UIDBASE[:NUIDS]]	Set the user namespace shift\n",
 	       program_name);
 }
@@ -217,310 +145,6 @@ static int write_file(char *filename, char *fmt, ...)
 	va_end(ap);
 
 	return ret;
-}
-
-static int userns_lchown(const char *path, uid_t uid, gid_t gid)
-{
-	int ret;
-
-	if (uid == UID_INVALID && gid == GID_INVALID)
-		return 0;
-
-	if (uid != UID_INVALID) {
-		uid += arg_uid_shift;
-
-		if (uid < arg_uid_shift || uid >= arg_uid_shift + arg_uid_range) {
-			ret = -EOVERFLOW;
-			printf("userns_lchown() failed: %d\n", ret);
-			return ret;
-		}
-	}
-
-	if (gid != GID_INVALID) {
-		gid += arg_uid_shift;
-
-		if (gid < arg_uid_shift || gid >= arg_uid_shift + arg_uid_range) {
-			ret = -EOVERFLOW;
-			printf("userns_lchown() failed: %d\n", ret);
-			return ret;
-		}
-	}
-
-	ret = lchown(path, uid, gid);
-	if (ret < 0) {
-		ret = -errno;
-		printf("lchown() failed on %s: %d (%m)\n",
-		       path, ret);
-		return ret;
-	}
-
-	return 0;
-}
-
-static int copy_devnodes(const char *root)
-{
-	static const char devnodes[] =
-		"null\0"
-		"zero\0"
-		"full\0"
-		"random\0"
-		"urandom\0"
-		"tty\0";
-
-	const char *d;
-	int ret = 0;
-
-	for (d = devnodes; (d) && *(d); (d) = strchr((d), 0)+1) {
-		char *to;
-		char *where;
-		unsigned len;
-		struct stat st;
-
-		len = strlen(root) + 1 + strlen("/dev/") +
-			strlen(d) + 1;
-		to = alloca(len);
-		where = alloca(len);
-		if (!where || !to) {
-			ret = -errno;
-			printf("alloca() failed: %d (%m)\n", ret);
-			return ret;
-		}
-
-		ret = snprintf(to, len, "/dev/%s", d);
-		ret = snprintf(where, len, "%s/dev/%s", root, d);
-		if (ret < 0) {
-			ret = -errno;
-			printf("snprintf() failed: %d (%m)\n", ret);
-			return ret;
-		}
-
-		if (stat(to, &st) < 0) {
-			ret = -errno;
-			printf("stat() %s failed: %d (%m)\n", to, ret);
-			return ret;
-		} else if (!S_ISCHR(st.st_mode) && !S_ISBLK(st.st_mode)) {
-			ret = -EIO;
-			printf("%s is not a char or block device\n", to);
-			return ret;
-		} else {
-			int fd;
-
-			ret = mknod(where, st.st_mode, st.st_rdev);
-			if (!ret) {
-				ret = userns_lchown(where, 0, 0);
-				if (ret < 0) {
-					printf("failed to chown() %s: %d (%m)\n",
-					       where, ret);
-				}
-				continue;
-			}
-
-			fd = open(where, O_WRONLY|O_CREAT| O_CLOEXEC|O_NOCTTY, 0644);
-			if (ret < 0) {
-				ret = -errno;
-				printf("failed to open() %s: %d (%m)\n",
-				       where, ret);
-				return ret;
-			}
-
-			ret = fchown(fd, 0, 0);
-			if (ret < 0) {
-				ret = -errno;
-				printf("failed to fchown() %s: %d (%m)\n",
-				       where, ret);
-				return ret;
-			}
-
-			ret = mount(to, where, NULL, MS_BIND, NULL);
-			if (ret < 0) {
-				ret = -errno;
-				printf("failed to mount() %s: %d (%m)\n",
-				       where, ret);
-				return ret;
-			}
-
-			ret = userns_lchown(where, 0, 0);
-			if (ret < 0) {
-				printf("failed to chown() %s: %d (%m)\n",
-				       where, ret);
-			}
-			close(fd);
-		}
-	}
-
-	return 0;
-}
-
-static int dev_fd_setup(const char *root)
-{
-	return 0;
-}
-
-/*
-static int mount_overlay(const char *lower, const char *upper,
-			 const char *work, const char *merge)
-{
-	int ret;
-	char *buf;
-
-	buf = alloca(1024);
-	if (!buf) {
-		ret = -errno;
-		printf("alloca() failed: %d (%m)\n", ret);
-		return ret;
-	}
-
-	ret = snprintf(buf, 1024, "lowerdir=%s,upperdir=%s,workdir=%s,shift_uids,shift_gids",
-		       lower, upper, work);
-	if (ret < 0) {
-		ret = -errno;
-		printf("snprintf() failed: %d (%m)\n", ret);
-		return ret;
-	}
-
-	ret = mount("overlay", merge, "overlay", 0, buf);
-	if (ret < 0) {
-		ret = -errno;
-		printf("failed to mount() %s: %d (%m)\n", merge, ret);
-		return ret;
-	}
-
-	ret = userns_lchown(merge, 0, 0);
-	if (ret < 0) {
-		printf("failed to lchown() %s: %d (%m)\n",
-		       merge, ret);
-		return ret;
-	}
-
-	ret = userns_lchown(work, 0, 0);
-	if (ret < 0) {
-		printf("failed to lchown() %s: %d (%m)\n", work, ret);
-		return ret;
-	}
-
-	ret = snprintf(buf, 1024, "%s/work", work);
-	if (ret < 0) {
-		printf("snprintf() failed: %d (%m)\n", ret);
-		return ret;
-	}
-
-	ret = userns_lchown(buf, 0, 0);
-	if (ret < 0) {
-		printf("failed to lchown() %s: %d (%m)\n",
-		       buf, ret);
-		return ret;
-	}
-
-	return 0;
-}
-*/
-
-/* Setup a base file system */
-static int setup_basic_filesystem(const char *root, uid_t uid,
-				  gid_t gid, bool in_userns)
-{
-	int ret = 0;
-	int fd;
-	unsigned i;
-	bool global = !in_userns;
-
-	fd = open(root, O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
-	if (fd < 0) {
-		ret = -errno;
-		printf("open() %s failed: %d (%m)\n", root, ret);
-		return ret;
-	}
-
-	for (i = 0; i < ARRAY_SIZE(fs_table); i++) {
-		if (faccessat(fd, fs_table[i].dir,
-			      F_OK, AT_SYMLINK_NOFOLLOW) < 0 &&
-		    fs_table[i].ignore_failure) {
-			ret = -errno;
-			printf("faccessat() %s failed: %d (%m)\n",
-			       fs_table[i].dir, ret);
-			goto out;
-		}
-	}
-
-	for (i = 0; i < ARRAY_SIZE(mnt_table); i++) {
-		unsigned len;
-		char *where;
-
-		if (global != mnt_table[i].out_userns &&
-		    in_userns != mnt_table[i].in_userns)
-			continue;
-
-		len = strlen(root) + 1 + strlen(mnt_table[i].where) + 1;
-		where = alloca(len);
-		if (!where) {
-			ret = -errno;
-			printf("alloca() failed: %d (%m)\n", ret);
-			goto out;
-		}
-
-		ret = snprintf(where, len, "%s%s", root, mnt_table[i].where);
-		if (ret < 0) {
-			ret = -errno;
-			printf("snprintf() failed: %d (%m)\n", ret);
-			goto out;
-		}
-
-		/* TODO: test if path is a mount point */
-
-		/* TODO: check mkdir() errors */
-		ret = mkdir(where, 0755);
-
-		ret = mount(mnt_table[i].what, where,
-			    mnt_table[i].type,
-			    mnt_table[i].flags,
-			    mnt_table[i].options);
-		if (ret < 0) {
-			ret = -errno;
-			printf("mount() %s options:%s failed: %d (%m)\n",
-			       where, mnt_table[i].options, ret);
-			if (mnt_table[i].fatal)
-				goto out;
-		}
-	}
-
-out:
-	close(fd);
-	return ret;
-}
-
-static int setup_move_root(const char *path)
-{
-	int ret;
-
-	ret = chdir(path);
-	if (ret < 0) {
-		ret = -errno;
-		printf("chdir() failed: %d (%m)\n", ret);
-		return ret;
-	}
-
-	ret = mount(path, "/", NULL, MS_MOVE, NULL);
-	if (ret < 0) {
-		ret = -errno;
-		printf("mount() failed: %d (%m)\n", ret);
-		return ret;
-	}
-
-	ret = chroot(".");
-	if (ret < 0) {
-		ret = -errno;
-		printf("chroot() failed: %d (%m)\n", ret);
-		return ret;
-	}
-
-	ret = chdir("/");
-	if (ret < 0) {
-		ret = -errno;
-		printf("chdir() failed: %d (%m)\n", ret);
-		return ret;
-	}
-
-	return 0;
 }
 
 static int access_inodes(void)
@@ -648,13 +272,6 @@ static int child_test_filesystems(void)
 	return ret;
 }
 
-static int parent_test_filesystems(void)
-{
-	/* TODO stat inode entries from parent */
-
-	return 0;
-}
-
 static int outer_child(void)
 {
 	int ret;
@@ -732,46 +349,9 @@ static int test_uidshift_mount(void)
 		return ret;
 	}
 
-	/* Turn directory into bind mount */
-	ret = mount(root_dir, root_dir, NULL, MS_BIND|MS_REC, NULL);
-	if (ret < 0) {
-		ret = -errno;
-		printf("mount() %s failed: %d (%m)\n", root_dir, ret);
-		return ret;
-	}
-
-	ret = setup_basic_filesystem(root_dir, arg_uid_shift,
-				     (gid_t) arg_uid_shift, false);
-	if (ret < 0) {
-		ret = -errno;
-		printf("error failed to setup a basic filesystem\n");
-		return ret;
-	}
-
-	ret = copy_devnodes(root_dir);
-	if (ret < 0) {
-		ret = -errno;
-		printf("copy_devnodes() failed: %d (%m)\n", ret);
-		return ret;
-	}
-
-	ret = dev_fd_setup(root_dir);
-	if (ret < 0) {
-		ret = -errno;
-		printf("dev_fs_setup() failed: %d (%m)\n", ret);
-		return ret;
-	}
-
-	ret = setup_move_root(root_dir);
-	if (ret < 0) {
-		ret = -errno;
-		printf("setup_move_root() failed: %d (%m)\n", ret);
-		return ret;
-	}
-
 	pid = syscall(__NR_clone, SIGCHLD|CLONE_NEWUSER|
 		      CLONE_NEWNS|CLONE_NEWIPC|CLONE_NEWPID|
-		      CLONE_NEWUTS, NULL);
+		      CLONE_NEWUTS|CLONE_MNTNS_SHIFT_UIDGID, NULL);
 	if (pid < 0) {
 		ret = -errno;
 		printf("clone() failed: %d (%m)\n", ret);
@@ -801,14 +381,6 @@ static int test_uidshift_mount(void)
 			_exit(EXIT_FAILURE);
 		}
 
-		ret = setup_basic_filesystem("/", arg_uid_shift,
-					     (gid_t) arg_uid_shift, true);
-		if (ret < 0) {
-			ret = -errno;
-			printf("error failed to setup a basic filesystem\n");
-			_exit(EXIT_FAILURE);
-		}
-
 		ret = outer_child();
 		_exit(ret);
 	}
@@ -831,12 +403,6 @@ static int test_uidshift_mount(void)
 	if (ret < 0) {
 		ret = -errno;
 		printf("error eventfd_write(): %d (%m)\n", ret);
-		return ret;
-	}
-
-	ret = parent_test_filesystems();
-	if (ret < 0) {
-		printf("Testing filesystem in parent failed\n");
 		return ret;
 	}
 
@@ -947,14 +513,6 @@ int main(int argc, char *argv[])
 
 			break;
 
-		case 'd':
-			root_dir = strdup(optarg);
-			if(!root_dir) {
-				printf("strdup() failed: %d (%m)\n", -errno);
-				exit(EXIT_FAILURE);
-			}
-			break;
-
 		default:
 			break;
 		}
@@ -963,12 +521,6 @@ int main(int argc, char *argv[])
 	if (getuid() != 0) {
 		printf("%s: can't map arbitrary uids, test skipped.\n",
 		       program_name);
-		exit(EXIT_SUCCESS);
-	}
-
-	if (!root_dir) {
-		printf("Failed to get root filesystem dir, please set '-d'.\n");
-		help();
 		exit(EXIT_SUCCESS);
 	}
 
