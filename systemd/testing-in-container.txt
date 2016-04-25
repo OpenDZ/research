@@ -1,0 +1,10 @@
+$ sudo yum -y --releasever=23 --installroot=$PATH/fedora-tree --disablerepo='*' --enablerepo=fedora install systemd passwd yum fedora-release vim
+$ sudo systemd-nspawn -D $PATH/fedora-tree/
+# passwd
+
+...
+$ sudo systemd-nspawn -bD $PATH/fedora-tree/ 3
+
+
+compile systemd, install and boot:
+$ make -j10 && sudo DESTDIR=$PATH/fedora-tree make install && sudo systemd-nspawn -bD $PATH/fedora-tree/ 3
