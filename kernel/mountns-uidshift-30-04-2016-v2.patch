@@ -1,0 +1,365 @@
+diff --git a/fs/attr.c b/fs/attr.c
+index 25b24d0..55ed066 100644
+--- a/fs/attr.c
++++ b/fs/attr.c
+@@ -47,26 +47,38 @@ int inode_change_ok(const struct inode *inode, struct iattr *attr)
+ 		return 0;
+ 
+ 	/* Make sure a caller can chown. */
+-	if ((ia_valid & ATTR_UID) &&
+-	    (!uid_eq(current_fsuid(), inode->i_uid) ||
+-	     !uid_eq(attr->ia_uid, inode->i_uid)) &&
+-	    !capable_wrt_inode_uidgid(inode, CAP_CHOWN))
+-		return -EPERM;
++	if (ia_valid & ATTR_UID) {
++		/* Shift to virtual if necessary */
++		kuid_t i_uid = vfs_shift_i_uid_to_virtual(inode);
++
++		if ((!uid_eq(current_fsuid(), i_uid) ||
++		     !uid_eq(attr->ia_uid, inode->i_uid)) &&
++		    !capable_wrt_inode_uidgid(inode, CAP_CHOWN))
++			return -EPERM;
++	}
+ 
+ 	/* Make sure caller can chgrp. */
+-	if ((ia_valid & ATTR_GID) &&
+-	    (!uid_eq(current_fsuid(), inode->i_uid) ||
+-	    (!in_group_p(attr->ia_gid) && !gid_eq(attr->ia_gid, inode->i_gid))) &&
+-	    !capable_wrt_inode_uidgid(inode, CAP_CHOWN))
++	if (ia_valid & ATTR_GID) {
++		/* Shift to virtual if necessary */
++		kuid_t i_uid = vfs_shift_i_uid_to_virtual(inode);
++		/* Shift it back to virtual if necessary */
++		kgid_t ia_gid = vfs_kgid_disk_to_virtual(inode, attr->ia_gid);
++
++		if ((!uid_eq(current_fsuid(), i_uid) ||
++		     (!in_group_p(ia_gid) &&
++		      !gid_eq(attr->ia_gid, inode->i_gid))) &&
++		    !capable_wrt_inode_uidgid(inode, CAP_CHOWN))
+ 		return -EPERM;
++	}
+ 
+ 	/* Make sure a caller can chmod. */
+ 	if (ia_valid & ATTR_MODE) {
+ 		if (!inode_owner_or_capable(inode))
+ 			return -EPERM;
+ 		/* Also check the setgid bit! */
+-		if (!in_group_p((ia_valid & ATTR_GID) ? attr->ia_gid :
+-				inode->i_gid) &&
++		if (!in_group_p((ia_valid & ATTR_GID) ?
++				vfs_kgid_disk_to_virtual(inode, attr->ia_gid) :
++				vfs_shift_i_gid_to_virtual(inode)) &&
+ 		    !capable_wrt_inode_uidgid(inode, CAP_FSETID))
+ 			attr->ia_mode &= ~S_ISGID;
+ 	}
+@@ -209,6 +221,16 @@ int notify_change(struct dentry * dentry, struct iattr * attr, struct inode **de
+ 			inode->i_flags &= ~S_NOSEC;
+ 	}
+ 
++	/*
++	 * Shift if necessary the UID and GID that are mean to be written
++	 * into inodes's uid/gid to on-disk view. Do that as early as
++	 * possible.
++	 */
++	if ((ia_valid & ATTR_UID))
++		attr->ia_uid = vfs_shift_kuid_to_disk(inode, attr->ia_uid);
++	if ((ia_valid & ATTR_GID))
++		attr->ia_gid = vfs_shift_kgid_to_disk(inode, attr->ia_gid);
++
+ 	now = current_fs_time(inode->i_sb);
+ 
+ 	attr->ia_ctime = now;
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 304c712..375fd79 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -1194,6 +1194,7 @@ enum {
+ 	Opt_dioread_nolock, Opt_dioread_lock,
+ 	Opt_discard, Opt_nodiscard, Opt_init_itable, Opt_noinit_itable,
+ 	Opt_max_dir_size_kb, Opt_nojournal_checksum,
++	Opt_vfs_shift_uids, Opt_vfs_shift_gids,
+ };
+ 
+ static const match_table_t tokens = {
+@@ -1279,6 +1280,8 @@ static const match_table_t tokens = {
+ 	{Opt_removed, "reservation"},	/* mount option from ext2/3 */
+ 	{Opt_removed, "noreservation"}, /* mount option from ext2/3 */
+ 	{Opt_removed, "journal=%u"},	/* mount option from ext2/3 */
++	{Opt_vfs_shift_uids, "vfs_shift_uids"},
++	{Opt_vfs_shift_gids, "vfs_shift_gids"},
+ 	{Opt_err, NULL},
+ };
+ 
+@@ -1521,6 +1524,12 @@ static int handle_mount_opt(struct super_block *sb, char *opt, int token,
+ 	case Opt_nolazytime:
+ 		sb->s_flags &= ~MS_LAZYTIME;
+ 		return 1;
++	case Opt_vfs_shift_uids:
++		sb->s_iflags |= SB_I_SHIFT_UID;
++		return 1;
++	case Opt_vfs_shift_gids:
++		sb->s_iflags |= SB_I_SHIFT_GID;
++		return 1;
+ 	}
+ 
+ 	for (m = ext4_mount_opts; m->token != Opt_err; m++)
+@@ -1920,6 +1929,10 @@ static int _ext4_show_options(struct seq_file *seq, struct super_block *sb,
+ 		SEQ_OPTS_PRINT("max_dir_size_kb=%u", sbi->s_max_dir_size_kb);
+ 	if (test_opt(sb, DATA_ERR_ABORT))
+ 		SEQ_OPTS_PUTS("data_err=abort");
++	if (sb->s_iflags & SB_I_SHIFT_UID)
++		SEQ_OPTS_PUTS("vfs_shift_uids");
++	if (sb->s_iflags & SB_I_SHIFT_GID)
++		SEQ_OPTS_PUTS("vfs_shift_gids");
+ 
+ 	ext4_show_quota_options(seq, sb);
+ 	return 0;
+diff --git a/fs/inode.c b/fs/inode.c
+index 69b8b52..e6ee56a 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -1940,13 +1940,13 @@ EXPORT_SYMBOL(init_special_inode);
+ void inode_init_owner(struct inode *inode, const struct inode *dir,
+ 			umode_t mode)
+ {
+-	inode->i_uid = current_fsuid();
++	inode->i_uid = vfs_shift_kuid_to_disk(inode, current_fsuid());
+ 	if (dir && dir->i_mode & S_ISGID) {
+ 		inode->i_gid = dir->i_gid;
+ 		if (S_ISDIR(mode))
+ 			mode |= S_ISGID;
+ 	} else
+-		inode->i_gid = current_fsgid();
++		inode->i_gid = vfs_shift_kgid_to_disk(inode, current_fsgid());
+ 	inode->i_mode = mode;
+ }
+ EXPORT_SYMBOL(inode_init_owner);
+@@ -1961,12 +1961,13 @@ EXPORT_SYMBOL(inode_init_owner);
+ bool inode_owner_or_capable(const struct inode *inode)
+ {
+ 	struct user_namespace *ns;
++	kuid_t i_uid = vfs_shift_i_uid_to_virtual(inode);
+ 
+-	if (uid_eq(current_fsuid(), inode->i_uid))
++	if (uid_eq(current_fsuid(), i_uid))
+ 		return true;
+ 
+ 	ns = current_user_ns();
+-	if (ns_capable(ns, CAP_FOWNER) && kuid_has_mapping(ns, inode->i_uid))
++	if (ns_capable(ns, CAP_FOWNER) && kuid_has_mapping(ns, i_uid))
+ 		return true;
+ 	return false;
+ }
+diff --git a/fs/namei.c b/fs/namei.c
+index 1d9ca2d..f7ee498 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -289,8 +289,10 @@ static int check_acl(struct inode *inode, int mask)
+ static int acl_permission_check(struct inode *inode, int mask)
+ {
+ 	unsigned int mode = inode->i_mode;
++	kuid_t i_uid = vfs_shift_i_uid_to_virtual(inode);
++	kgid_t i_gid = vfs_shift_i_gid_to_virtual(inode);
+ 
+-	if (likely(uid_eq(current_fsuid(), inode->i_uid)))
++	if (likely(uid_eq(current_fsuid(), i_uid)))
+ 		mode >>= 6;
+ 	else {
+ 		if (IS_POSIXACL(inode) && (mode & S_IRWXG)) {
+@@ -299,7 +301,7 @@ static int acl_permission_check(struct inode *inode, int mask)
+ 				return error;
+ 		}
+ 
+-		if (in_group_p(inode->i_gid))
++		if (in_group_p(i_gid))
+ 			mode >>= 3;
+ 	}
+ 
+diff --git a/fs/namespace.c b/fs/namespace.c
+index f368a5be..5e6fca2 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -1664,33 +1664,108 @@ struct mnt_namespace *to_mnt_ns(struct ns_common *ns)
+ 	return container_of(ns, struct mnt_namespace, ns);
+ }
+ 
+-kuid_t vfs_shift_inode_uid(const struct inode *inode)
++kuid_t vfs_shift_i_uid_to_virtual(const struct inode *inode)
+ {
+-	kuid_t kuid = inode->i_uid;
++	kuid_t i_uid = inode->i_uid;
+ 	struct mnt_namespace *ns = current->nsproxy->mnt_ns;
+ 
+-	/* Shift kuid if necessary */
++	/* Shift uid if necessary to mntns */
+ 	if (mntns_shift_uidgid(ns) && inode->i_sb->s_iflags & SB_I_SHIFT_UID &&
+-	    !kuid_has_mapping(ns->user_ns, kuid))
+-		return make_kuid(ns->user_ns, kuid.val);
++	    !kuid_has_mapping(ns->user_ns, i_uid))
++		return make_kuid(ns->user_ns, i_uid.val);
+ 
+-	return kuid;
++	return i_uid;
+ }
+-EXPORT_SYMBOL_GPL(vfs_shift_inode_uid);
++EXPORT_SYMBOL_GPL(vfs_shift_i_uid_to_virtual);
+ 
+-kgid_t vfs_shift_inode_gid(const struct inode *inode)
++kgid_t vfs_shift_i_gid_to_virtual(const struct inode *inode)
+ {
+-	kgid_t kgid = inode->i_gid;
++	kgid_t i_gid = inode->i_gid;
+ 	struct mnt_namespace *ns = current->nsproxy->mnt_ns;
+ 
+-	/* Shift kgid if necessary */
++	/* Shift gid if necessary to mntns */
++	if (mntns_shift_uidgid(ns) && inode->i_sb->s_iflags & SB_I_SHIFT_GID &&
++	    !kgid_has_mapping(ns->user_ns, i_gid))
++		return make_kgid(ns->user_ns, i_gid.val);
++
++	return i_gid;
++}
++EXPORT_SYMBOL_GPL(vfs_shift_i_gid_to_virtual);
++
++kuid_t vfs_shift_kuid_to_disk(const struct inode *inode, kuid_t kuid)
++{
++	uid_t uid;
++	struct mnt_namespace *ns;
++
++	if (!current->mm)
++		return kuid;
++
++	ns = current->nsproxy->mnt_ns;
++
++	/* Nothing to do ? */
++	if (!mntns_shift_uidgid(ns) || !(inode->i_sb->s_iflags & SB_I_SHIFT_UID))
++		return kuid;
++
++	/*
++	 * If kuid has a mapping in the mountns get its uid_t otherwise get it
++	 * from init_user_ns
++	 */
++	if (kuid_has_mapping(ns->user_ns, kuid))
++		uid = from_kuid(ns->user_ns, kuid);
++	else
++		uid = from_kuid(&init_user_ns, kuid);
++
++	if (uid == (uid_t) -1)
++		return kuid;
++
++	/* Get the final kuid that will be used for on-disk writes */
++	return make_kuid(&init_user_ns, uid);
++}
++EXPORT_SYMBOL_GPL(vfs_shift_kuid_to_disk);
++
++kgid_t vfs_shift_kgid_to_disk(const struct inode *inode, kgid_t kgid)
++{
++	gid_t gid;
++	struct mnt_namespace *ns;
++
++	if (!current->mm)
++		return kgid;
++
++	ns = current->nsproxy->mnt_ns;
++
++	/* Nothing to do ? */
++	if (!mntns_shift_uidgid(ns) || !(inode->i_sb->s_iflags & SB_I_SHIFT_GID))
++		return kgid;
++
++	/*
++	 * If kgid has a mapping in the mountns get its gid_t otherwise get it
++	 * from init_user_ns
++	 */
++	if (kgid_has_mapping(ns->user_ns, kgid))
++		gid = from_kgid(ns->user_ns, kgid);
++	else
++		gid = from_kgid(&init_user_ns, kgid);
++
++	if (gid == (gid_t) -1)
++		return kgid;
++
++	/* Get the final kgid that will be used for on-disk writes */
++	return make_kgid(&init_user_ns, gid);
++}
++EXPORT_SYMBOL_GPL(vfs_shift_kgid_to_disk);
++
++kgid_t vfs_kgid_disk_to_virtual(const struct inode *inode, kgid_t kgid)
++{
++	struct mnt_namespace *ns = current->nsproxy->mnt_ns;
++
++	/* shift kgid if necessary */
+ 	if (mntns_shift_uidgid(ns) && inode->i_sb->s_iflags & SB_I_SHIFT_GID &&
+ 	    !kgid_has_mapping(ns->user_ns, kgid))
+ 		return make_kgid(ns->user_ns, kgid.val);
+ 
+ 	return kgid;
+ }
+-EXPORT_SYMBOL_GPL(vfs_shift_inode_gid);
++EXPORT_SYMBOL_GPL(vfs_kgid_disk_to_virtual);
+ 
+ static bool mnt_ns_loop(struct dentry *dentry)
+ {
+diff --git a/fs/stat.c b/fs/stat.c
+index bc045c7..3480f4a 100644
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -26,6 +26,8 @@ void generic_fillattr(struct inode *inode, struct kstat *stat)
+ 	stat->nlink = inode->i_nlink;
+ 	stat->uid = inode->i_uid;
+ 	stat->gid = inode->i_gid;
++	stat->uid = vfs_shift_i_uid_to_virtual(inode);
++	stat->gid = vfs_shift_i_gid_to_virtual(inode);
+ 	stat->rdev = inode->i_rdev;
+ 	stat->size = i_size_read(inode);
+ 	stat->atime = inode->i_atime;
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 1e7c974..8783fa2 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1567,12 +1567,15 @@ extern void inode_init_owner(struct inode *inode, const struct inode *dir,
+ 			umode_t mode);
+ 
+ /*
+- * VFS helpers to shift kuid and kgid of inodes if the filesystem supports it.
+- * The shift is done according to the user namespace of the containing mount
+- * namespace
++ * VFS helpers to shift inodes's uid/gid and passed values to either virutal
++ * or on-disk view. The shift is done according to rules of the user namespace
++ * of the containing mount namespace. These are mean to be used only by VFS.
+  */
+-extern kuid_t vfs_shift_inode_uid(const struct inode *inode);
+-extern kgid_t vfs_shift_inode_gid(const struct inode *inode);
++extern kuid_t vfs_shift_i_uid_to_virtual(const struct inode *inode);
++extern kgid_t vfs_shift_i_gid_to_virtual(const struct inode *inode);
++extern kgid_t vfs_kgid_disk_to_virtual(const struct inode *inode, kgid_t kgid);
++extern kuid_t vfs_shift_kuid_to_disk(const struct inode *inode, kuid_t kuid);
++extern kgid_t vfs_shift_kgid_to_disk(const struct inode *inode, kgid_t kgid);
+ 
+ /*
+  * VFS FS_IOC_FIEMAP helper definitions.
+diff --git a/kernel/capability.c b/kernel/capability.c
+index 45432b5..2fea64f 100644
+--- a/kernel/capability.c
++++ b/kernel/capability.c
+@@ -441,9 +441,19 @@ EXPORT_SYMBOL(file_ns_capable);
+  */
+ bool capable_wrt_inode_uidgid(const struct inode *inode, int cap)
+ {
++	kuid_t i_uid;
++	kgid_t i_gid;
+ 	struct user_namespace *ns = current_user_ns();
+ 
+-	return ns_capable(ns, cap) && kuid_has_mapping(ns, inode->i_uid) &&
+-		kgid_has_mapping(ns, inode->i_gid);
++	/*
++	 * Check if inode's UID/GID are mean to be shifted into the current
++	 * mount namespace, if so we use the result to check if the shifted
++	 * uid/gid have a mapping in current's user namespace.
++	 */
++	i_uid = vfs_shift_i_uid_to_virtual(inode);
++	i_gid = vfs_shift_i_gid_to_virtual(inode);
++
++	return ns_capable(ns, cap) && kuid_has_mapping(ns, i_uid) &&
++		kgid_has_mapping(ns, i_gid);
+ }
+ EXPORT_SYMBOL(capable_wrt_inode_uidgid);
