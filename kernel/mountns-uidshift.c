@@ -30,7 +30,7 @@
 # define CLONE_NEWUSER 0x10000000
 #endif
 
-#define CLONE_MNTNS_SHIFT_UIDGID     0x04000000
+#define CLONE_MNTNS_SHIFT_UIDGID     0x00400000
 
 #define UID_INVALID ((uid_t) -1)
 #define GID_INVALID ((gid_t) -1)
@@ -295,11 +295,13 @@ static int outer_child(void)
 	if (ret < 0)
 		return ret;
 
+	/*
 	ret = child_test_filesystems();
 	if (ret < 0) {
 		printf("failed at filesystems test\n");
-		/* return ret; */
+		return ret;
 	}
+	*/
 
 	/* TODO: test here stats and other uidshift results */
 	execle("/bin/bash", NULL, NULL, NULL);
